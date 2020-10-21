@@ -5,9 +5,11 @@
 
 #include "DDpackage.h"
 
+#include <cstdlib>
+
 namespace dd {
 
-	Node Package::terminal{ nullptr, {{ nullptr, CN::ZERO}, { nullptr, CN::ZERO }, { nullptr, CN::ZERO }, { nullptr, CN::ZERO }}, 0, -1, true, true};
+	Node Package::terminal{ nullptr, {{ nullptr, CN::ZERO}, { nullptr, CN::ZERO }, { nullptr, CN::ZERO }, { nullptr, CN::ZERO }}, CN::ONE, 0, -1, true, true, Disabled};
 	constexpr Edge Package::DDzero;
 	constexpr Edge Package::DDone;
 
@@ -723,6 +725,11 @@ namespace dd {
                 std::exit(1);
             }
             activeNodeCount--;
+
+	        if (e.p->normalizationFactor != CN::ONE) {
+	        	unnormalizedNodes--;
+	        	e.p->normalizationFactor = CN::ONE;
+	        }
         }
     }
 
@@ -791,7 +798,7 @@ namespace dd {
             }
 
             return r;
-        } else if (which == conjTransp || which == transp) {
+        } else if (which == conjTransp || which == transp || which == CTkind::renormalize) {
             std::array<CTentry1, CTSLOTS>& table = CTable1.at(mode);
             const unsigned long i = CThash(a, b, which);
 
@@ -840,7 +847,7 @@ namespace dd {
             table[i].rw.i = r.w.i->val;
             table[i].which = which;
 
-        } else if (which == conjTransp || which == transp) {
+        } else if (which == conjTransp || which == transp || which == CTkind::renormalize) {
             std::array<CTentry1, CTSLOTS>& table = CTable1.at(mode);
             const unsigned long i = CThash(a, b, which);
 
@@ -892,6 +899,8 @@ namespace dd {
     Edge Package::makeNonterminal(const short v, const Edge *edge, const bool cached) {
     	Edge e{ getNode(), CN::ONE};
         e.p->v = v;
+        e.p->normalizationFactor = CN::ONE;
+        e.p->computeMatrixProperties = computeMatrixProperties;
 
         std::memcpy(e.p->e, edge, NEDGE * sizeof(Edge));
         e = normalize(e, cached); // normalize it
@@ -1428,6 +1437,7 @@ namespace dd {
     	auto hitRatioAdd = CTlook[ad] == 0? 0 :  (double) CThit[ad] / (double)CTlook[ad];
 		auto hitRatioMul = CTlook[mult] == 0? 0 :  (double) CThit[mult] / (double)CTlook[mult];
 		auto hitRatioKron = ((CTlook[kron] == 0) ? 0 : (double) CThit[kron] / (double)CTlook[kron]);
+		auto hitRatioRenormalize = ((CTlook[CTkind::renormalize] == 0) ? 0 : (double) CThit[CTkind::renormalize] / (double)CTlook[CTkind::renormalize]);
 
 
         std::cout << "\nDD statistics:"
@@ -1437,11 +1447,13 @@ namespace dd {
                   << "\n    add:  " << nOps[ad]
                   << "\n    mult: " << nOps[mult]
                   << "\n    kron: " << nOps[kron]
-                  << "\n  Compute table hit ratios (hits/looks/ratio):"
+                  << "\n    renormalize: " << nOps[CTkind::renormalize]
+		          << "\n  Compute table hit ratios (hits/looks/ratio):"
                   << "\n    adds: " << CThit[ad] << " / " << CTlook[ad] << " / " << hitRatioAdd
                   << "\n    mult: " << CThit[mult] << " / " << CTlook[mult] << " / " << hitRatioMul
 		          << "\n    kron: " << CThit[kron] << " / " << CTlook[kron] << " / " << hitRatioKron
-                  << "\n  UniqueTable:"
+		          << "\n    renormalize: " << CThit[CTkind::renormalize] << " / " << CTlook[CTkind::renormalize] << " / " << hitRatioRenormalize
+		          << "\n  UniqueTable:"
                   << "\n    Collisions: " << UTcol
                   << "\n    Matches:    " << UTmatch
                   << "\n" << std::flush;
@@ -1665,6 +1677,9 @@ namespace dd {
     }
 
 	void Package::checkSpecialMatrices(NodePtr p) {
+		if (p->computeMatrixProperties == Disabled)
+			return;
+
 		p->ident = false;       // assume not identity
 		p->symm = false;           // assume symmetric
 
@@ -1678,162 +1693,22 @@ namespace dd {
 		p->ident = true;
 	}
 
-	/// exchange levels i and j of a decision diagram by pointer manipulation.
-	/// base case: j = i +/- 1 -> exchange pointers accordingly
-	/// general case: perform successive nearest-neighbour exchanges until i and j are swapped.
-	/// \param in decision diagram to operate on
-	/// \param i first index
-	/// \param j second index
-	/// \return decision diagram with level i and j exchanged
-	/// 		note that the nodes in the resulting decision diagram shall still follow the original ordering
-	/// 		n-1 > n-2 > ... > 1 > 0 from top to bottom.
-	///			the caller of this function is responsible for keeping track of the variable exchanges (cf. dynamicReorder(...))
-	Edge Package::exchange(Edge in, unsigned short i, unsigned short j) {
-		if (i == j) {
-			return in;
-		} else if (i > j){
-			return exchange(in, j, i);
-		}
-
-        if (in.p == nullptr || in.p->v < j) return in;
-        if ((i+1) == j) return exchangeBaseCase(in, i, j);
-
-        auto h = static_cast<short>(i);
-        auto g = static_cast<short>(i+1);
-
-        // shuffeling the lower level i up until it is in its position
-        while(g < j)
-            in = exchangeBaseCase(in, h++, g++);
-        in = exchangeBaseCase(in, h, g);
-
-        // shuffeling the upper level j down until it is in its position
-        while(h > i)
-            in = exchangeBaseCase(in, --h, --g);
-
-        return in;
+    void Package::printUniqueTable(unsigned short n) {
+	    std::cout << "Unique Table: " << std::endl;
+    	for (int i = n-1; i >=0; --i) {
+		    auto& unique = Unique[i];
+		    std::cout << "\t" << i << ":" << std::endl;
+		    for (size_t key=0; key<unique.size(); ++key) {
+		    	auto p = unique[key];
+			    if (unique[key] != nullptr)
+				    std::cout << key << ": ";
+		    	while (p != nullptr) {
+				    std::cout << "\t\t" << (uintptr_t)p << " " << p->ref << "\t";
+				    p = p->next;
+			    }
+		    	if (unique[key] != nullptr)
+		    	    std::cout << std::endl;
+		    }
+	    }
     }
-
-    Edge Package::exchangeBaseCase(Edge in, unsigned short i, unsigned short j){
-        // BASE CASE => (i+1) == j
-        std::queue<Edge> q{};
-        std::unordered_set<NodePtr> nodes(NODECOUNT_BUCKETS);
-
-        // collecting nodes
-        // using BFS-Algorithm to scan the given DD
-        q.push(in);
-        while (!q.empty()) {
-            Edge e = q.front();
-            // escaping the while-loop here should be possible, since once we hit a node with
-            // level < j we are not going to find any other node with level = j
-            // (this works because the DD always follows the ordering
-            // n-1 > n-2 > ... > 1 > 0 from top to bottom.)
-            /*
-            if (e.p->v < j )
-                break;
-            */
-
-            if (e.p->v == j)
-                nodes.insert(e.p);
-            q.pop();
-
-            for (auto & x : e.p->e) {
-                if (x.p != nullptr)
-                    q.push(x);
-            }
-        }
-
-        // exchange levels with the collected nodes
-        for (auto& node : nodes) {
-            Edge t[NEDGE][NEDGE];
-            node->v = static_cast<short>(j);
-
-            // creating matrix T
-            for (int x = 0; x < NEDGE; x++) {
-                for (int y = 0; y < NEDGE; y++) {
-                    if (node->e[y].p->v == i) {
-                        t[x][y] = node->e[y].p->e[x];
-                        auto c = cn.getTempCachedComplex();
-                        CN::mul(c, node->e[y].p->e[x].w, node->e[y].w);
-                        t[x][y].w = cn.lookup(c);
-                    } else {
-                        t[x][y] = node->e[y];
-                    }
-                }
-            }
-
-            // creating new nodes and appending corresponding edges
-            for (int x = 0; x < NEDGE; x++) {
-                Edge e{getNode(), CN::ONE};
-                e.p->v = static_cast<short>(i);
-                for (int y = 0; y < NEDGE; y++)
-                    e.p->e[y] = t[x][y];
-                e = normalize(e, false);
-                e = UTlookup(e);
-                decRef(node->e[x]);
-                node->e[x] = e;
-                incRef(node->e[x]);
-            }
-        }
-        garbageCollect(); // could cause potential problems with big circuits
-
-        return in;
-    }
-
-    /// Dynamically reorder a given decision diagram with the current variable map using the specific strategy
-	/// \param in decision diagram to reorder
-	/// \param varMap stores the variable mapping. varMap[circuit qubit] = corresponding DD qubit, e.g.
-	///			given the varMap (reversed var. order):
-	/// 			0->2,
-	/// 			1->1,
-	/// 			2->0
-	/// 		the circuit operation "H q[0]" leads to the DD equivalent to "H q[varMap[0]]" = "H q[2]".
-	///			the qubits in the decision diagram are always ordered as n-1 > n-2 > ... > 1 > 0
-	/// \param strat strategy to apply
-	/// \return the resulting decision diagram (and the changed variable map, which is returned as reference)
-	Edge Package::dynamicReorder(Edge in, std::map<unsigned short, unsigned short>& varMap, DynamicReorderingStrategy strat) {
-    	switch (strat) {
-			case None:
-				return in;
-			case Sifting:
-				return sifting(in, varMap);
-            case Random:
-                return random(in, varMap);
-            case Window3:
-                return window3(in, varMap);
-		}
-
-		return in;
-	}
-
-	/// Apply sifting dynamic reordering to a decision diagram given the current variable map
-	/// \param in decision diagram to apply sifting to
-	/// \param varMap stores the variable mapping (cf. dynamicReorder(...))
-	/// \return the resulting decision diagram (and the changed variable map, which is returned as reference)
-	Edge Package::sifting(Edge in, std::map<unsigned short, unsigned short>& varMap) {
-
-    	// TODO: implement sifting technique (using the exchange(...) function)
-        in = exchange(in, varMap[0], varMap[1]);
-        auto temp = varMap[0];
-        varMap[0] = varMap[1];
-        varMap[1] = temp;
-
-    	return in;
-	}
-
-	void Package::printUniqueTable(unsigned short n) {
-		std::cout << "Unique Table: " << std::endl;
-		for (int i = n-1; i >=0; --i) {
-			auto& unique = Unique[i];
-			std::cout << "\t" << i << ":" << std::endl;
-			for (const auto& node: unique) {
-				auto p = node;
-				while (p != nullptr) {
-					std::cout << "\t\t" << (uintptr_t)p << " " << p->ref << "\t";
-					p = p->next;
-				}
-				if (node != nullptr)
-					std::cout << std::endl;
-			}
-		}
-	}
 }
